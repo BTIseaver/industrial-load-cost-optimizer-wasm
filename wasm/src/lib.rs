@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use solar_positioning::{Location, RefractionCorrection, SolarPositions};
 use wasm_bindgen::prelude::*;
@@ -306,6 +306,40 @@ struct ResultRow {
     lcoe: f64,
     coarse_pairs: usize,
     refined_pairs: usize,
+    annual_energy: Vec<AnnualEnergy>,
+    worst_week: Vec<HourPoint>,
+    energy_mix: EnergyMix,
+}
+
+#[derive(Clone, Serialize)]
+struct AnnualEnergy {
+    year: usize,
+    solar_generation_mwh: f64,
+    solar_to_load_mwh: f64,
+    battery_to_load_mwh: f64,
+    generator_mwh: f64,
+    load_served_mwh: f64,
+    curtailed_mwh: f64,
+    fuel_mmbtu: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct HourPoint {
+    time: String,
+    solar_mw: f64,
+    battery_charge_mw: f64,
+    battery_discharge_mw: f64,
+    generator_mw: f64,
+    load_served_mw: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct EnergyMix {
+    solar_to_load_twh: f64,
+    battery_to_load_twh: f64,
+    generator_twh: f64,
+    total_load_twh: f64,
+    renewable_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -517,8 +551,131 @@ fn renewable_pct(gens: &[f64; YEARS], served: &[f64; YEARS]) -> f64 {
     100.0 * (1.0 - gens.iter().sum::<f64>() / served.iter().sum::<f64>().max(1.0))
 }
 
+fn detailed_dispatch(
+    profile: &[f64],
+    timestamps: &[String],
+    pv: i32,
+    bess: i32,
+    load: f64,
+    generator: f64,
+    longitude: f64,
+    gen_type: &str,
+) -> (Vec<AnnualEnergy>, Vec<HourPoint>) {
+    let energy = bess as f64 * BATTERY_HOURS;
+    let mut annual = Vec::with_capacity(YEARS);
+    let mut first_year = Vec::with_capacity(profile.len());
+    let heat = if gen_type == "Gas Engine" {
+        8989.0
+    } else {
+        9630.0
+    };
+    for year in 1..=YEARS {
+        let max_state = energy * (1.0 - BESS_DEG * (year - 1) as f64);
+        let pv_factor = pv as f64 / DC_AC * (1.0 - PV_DEG * (year - 1) as f64);
+        let mut state = energy;
+        let (mut solar_total, mut solar_to_load, mut battery_to_load, mut gen_total) =
+            (0.0, 0.0, 0.0, 0.0);
+        let (mut load_served, mut curtailed) = (0.0, 0.0);
+        for (i, p) in profile.iter().enumerate() {
+            let solar = p * pv_factor;
+            let balance = solar - load;
+            let (charge, discharge, gen, served, spill) = if balance > 0.0 {
+                let stored = balance.min(bess as f64).min(max_state - state);
+                state += stored * SQRT_RTE;
+                (stored, 0.0, 0.0, load, balance - stored)
+            } else {
+                let deficit = -balance;
+                let discharged = (deficit / SQRT_RTE).min(state).min(bess as f64);
+                let delivered = discharged * SQRT_RTE;
+                let remainder = deficit - delivered;
+                let gen_output = remainder.min(generator);
+                let unmet = (remainder - generator).max(0.0);
+                state -= discharged;
+                (0.0, delivered, gen_output, load - unmet, 0.0)
+            };
+            solar_total += solar;
+            solar_to_load += solar - charge - spill;
+            battery_to_load += discharge;
+            gen_total += gen;
+            load_served += served;
+            curtailed += spill;
+            if year == 1 {
+                let local = NaiveDateTime::parse_from_str(
+                    timestamps.get(i).map(String::as_str).unwrap_or(""),
+                    "%Y%m%d:%H%M",
+                )
+                .ok()
+                .map(|dt| dt + chrono::Duration::minutes((longitude * 4.0).round() as i64));
+                let time = local
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| format!("Hour {}", i + 1));
+                first_year.push(HourPoint {
+                    time,
+                    solar_mw: solar,
+                    battery_charge_mw: charge,
+                    battery_discharge_mw: discharge,
+                    generator_mw: gen,
+                    load_served_mw: served,
+                });
+            }
+        }
+        annual.push(AnnualEnergy {
+            year,
+            solar_generation_mwh: solar_total.round_ties_even(),
+            solar_to_load_mwh: solar_to_load.round_ties_even(),
+            battery_to_load_mwh: battery_to_load.round_ties_even(),
+            generator_mwh: gen_total.round_ties_even(),
+            load_served_mwh: load_served.round_ties_even(),
+            curtailed_mwh: curtailed.round_ties_even(),
+            fuel_mmbtu: (gen_total * heat / 1000.0).round_ties_even(),
+        });
+    }
+    let n = first_year.len();
+    let offset_minutes = (longitude * 4.0).round() as i64;
+    let candidates: Vec<usize> = (0..n)
+        .filter(|&i| {
+            NaiveDateTime::parse_from_str(
+                timestamps.get(i).map(String::as_str).unwrap_or(""),
+                "%Y%m%d:%H%M",
+            )
+            .ok()
+            .map(|dt| {
+                let local = dt + chrono::Duration::minutes(offset_minutes);
+                local.hour() == 0 && local.minute() == 0
+            })
+            .unwrap_or(i % 24 == ((-offset_minutes).rem_euclid(1440) / 60) as usize)
+        })
+        .collect();
+    let starts = if candidates.is_empty() {
+        (0..n).step_by(24).collect::<Vec<_>>()
+    } else {
+        candidates
+    };
+    let start = starts
+        .into_iter()
+        .filter(|_| n >= 168)
+        .min_by(|&a, &b| {
+            let sum = |start: usize| {
+                (0..168)
+                    .map(|k| first_year[(start + k) % n].solar_mw)
+                    .sum::<f64>()
+            };
+            sum(a).total_cmp(&sum(b))
+        })
+        .unwrap_or(0);
+    let worst_week = if n >= 168 {
+        (0..168)
+            .map(|k| first_year[(start + k) % n].clone())
+            .collect()
+    } else {
+        first_year
+    };
+    (annual, worst_week)
+}
+
 fn profile_result(
     profile: &[f64],
+    timestamps: &[String],
     c: &Inputs,
     configuration: &str,
     tilt: Option<f64>,
@@ -549,11 +706,38 @@ fn profile_result(
         c.load,
         if optimizing { c.load } else { c.generator },
     );
-    let renewable = renewable_pct(&design_gen, &design_served);
     let (reported_gen, reported_served) = if standalone {
         dispatch(profile, solar, bess, c.load, 0.0)
     } else {
         (design_gen, design_served)
+    };
+    let renewable = renewable_pct(&reported_gen, &reported_served);
+    let (annual_energy, worst_week) = detailed_dispatch(
+        profile,
+        timestamps,
+        solar,
+        bess,
+        c.load,
+        generator,
+        c.longitude,
+        &c.gen_type,
+    );
+    let lifetime_solar_to_load = annual_energy
+        .iter()
+        .map(|y| y.solar_to_load_mwh)
+        .sum::<f64>();
+    let lifetime_battery_to_load = annual_energy
+        .iter()
+        .map(|y| y.battery_to_load_mwh)
+        .sum::<f64>();
+    let lifetime_generator = annual_energy.iter().map(|y| y.generator_mwh).sum::<f64>();
+    let lifetime_load = annual_energy.iter().map(|y| y.load_served_mwh).sum::<f64>();
+    let energy_mix = EnergyMix {
+        solar_to_load_twh: lifetime_solar_to_load / 1_000_000.0,
+        battery_to_load_twh: lifetime_battery_to_load / 1_000_000.0,
+        generator_twh: lifetime_generator / 1_000_000.0,
+        total_load_twh: lifetime_load / 1_000_000.0,
+        renewable_pct: 100.0 * (1.0 - lifetime_generator / lifetime_load.max(1.0)),
     };
     let mut costs = c.clone();
     if standalone {
@@ -583,6 +767,9 @@ fn profile_result(
         lcoe: result_lcoe,
         coarse_pairs,
         refined_pairs,
+        annual_energy,
+        worst_week,
+        energy_mix,
     }
 }
 
@@ -720,9 +907,14 @@ fn solve(c: Inputs) -> Result<Output, String> {
     if c.mode == "optimize" && !(c.target == 95.0 || c.target == 99.0) {
         return Err("Target must be 95% or 99%".into());
     }
+    let timestamps = c
+        .weather
+        .iter()
+        .map(|row| row.time_utc.clone())
+        .collect::<Vec<_>>();
     let mut comparison: Vec<ResultRow> = profiles
         .iter()
-        .map(|(label, p, tilt)| profile_result(p, &c, label, *tilt))
+        .map(|(label, p, tilt)| profile_result(p, &timestamps, &c, label, *tilt))
         .collect();
     if comparison.iter().any(|r| !r.lcoe.is_finite()) {
         return Err("No energy served; cannot calculate LCOE".into());
