@@ -1,0 +1,8 @@
+name = "industrial-load-pvgis-proxy"
+main = "worker.js"
+compatibility_date = "2026-10-21"
+
+[vars]
+# Set ALLOWED_ORIGINS with `wrangler secret` or in the dashboard, for example:
+# https://BTIseaver.github.io/industrial-load-cost-optimizer-wasm
+ALLOWED_ORIGINS = "https://BTIseaver.github.io/industrial-load-cost-optimizer-wasm,http://localhost:8000"

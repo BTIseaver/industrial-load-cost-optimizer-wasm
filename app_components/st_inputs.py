@@ -372,7 +372,7 @@ def create_system_inputs() -> Dict:
     with col4:
         generator_capacity = st.number_input(
             "Generator Capacity (MW)",
-            value=min(int(query_params.get("gen", 1000)), max(1000, int(datacenter_load))),
+            value=min(int(query_params.get("gen", 500)), max(1000, int(datacenter_load))),
             min_value=0,
             max_value=max(
                 1000,

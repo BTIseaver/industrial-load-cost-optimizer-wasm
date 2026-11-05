@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Industrial Load Cost Optimizer · Rust/WASM</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">RUST · WEBASSEMBLY · PVGIS</p>
+      <h1>Industrial Load Cost Optimizer</h1>
+      <p>Compare solar, storage, and gas generation for an industrial load. Hourly dispatch and LCOE calculations run locally in WebAssembly.</p>
+      <p class="credit">Adapted by Seaver Wang, originally produced by <a href="https://github.com/bengineer19">Ben James</a> and the <a href="https://offgrid.us">offgrid.us team</a>.</p>
+    </header>
+
+    <section class="panel">
+      <h2>1 · Location and system</h2>
+      <div class="grid four">
+        <label>Latitude <input id="lat" type="number" step="0.0001" value="35.199"></label>
+        <label>Longitude <input id="lon" type="number" step="0.0001" value="-101.845"></label>
+        <label>Industrial load (MW) <input id="load" type="number" min="1" step="50" value="500"></label>
+        <label>Generator capacity (MW) <input id="generator" type="number" min="0" step="10" value="500"></label>
+        <label>Solar PV capacity (MW DC) <input id="solar" type="number" min="0" step="50" value="2500"></label>
+        <label>BESS power (MW), 4-hour <input id="bess" type="number" min="0" step="50" value="2500"></label>
+        <label>Generator type <select id="gen-type"><option>Gas Turbine</option><option>Gas Engine</option></select></label>
+        <div class="array-toggles">
+          <label class="check"><input id="tracking-only" type="checkbox"> Tracking array only</label>
+          <label class="check"><input id="fixed-only" type="checkbox"> Fixed array only</label>
+        </div>
+      </div>
+      <p id="tilt-note" class="hint"></p>
+    </section>
+
+    <section class="panel">
+      <h2>2 · Quick assumptions</h2>
+      <p class="hint">Preset buttons fill cost inputs; you can still edit any value below.</p>
+      <div class="button-row" id="cost-presets">
+        <button data-preset="Low Cost">Low Cost</button><button data-preset="Middle Cost">Middle Cost</button><button data-preset="High Cost">High Cost</button><button data-preset="High Cost, Cheaper Storage">High Cost, Cheaper Storage</button>
+      </div>
+      <p id="cost-preset-label" class="hint">Cost assumptions: Current defaults</p>
+      <div class="button-row" id="gas-presets"><button data-gas="lower">Lower Cost Gas (default)</button><button data-gas="higher">Higher Cost Gas</button></div>
+      <p id="gas-preset-label" class="hint">Gas assumptions: Lower Cost Gas (default)</p>
+    </section>
+
+    <details class="panel" open>
+      <summary>3 · Financial, CAPEX, and O&amp;M inputs</summary>
+      <div class="grid four rates">
+        <label>Cost of debt (%) <input id="debt-cost" type="number" step="0.1" value="8"></label>
+        <label>Leverage (%) <input id="leverage" type="number" step="1" value="100"></label>
+        <label>Debt term (years) <input id="debt-term" type="number" step="1" value="20"></label>
+        <label>Cost of equity (%) <input id="equity-cost" type="number" step="0.1" value="0"></label>
+        <label>Investment tax credit (%) <input id="itc" type="number" step="0.1" value="0"></label>
+        <label>Combined tax rate (%) <input id="tax-rate" type="number" step="0.1" value="0"></label>
+        <label>Solar CAPEX ($/W) <input id="pv-cost" type="number" step="0.001" value="0.600"></label>
+        <label>BESS CAPEX ($/kWh) <input id="bess-cost" type="number" step="0.1" value="200"></label>
+        <label>Generator CAPEX ($/kW) <input id="gen-capex" type="number" step="1" value="635"></label>
+        <label>System integration ($/kW load) <input id="integration" type="number" step="1" value="300"></label>
+        <label>Soft costs (% CAPEX) <input id="soft-pct" type="number" step="0.1" value="0"></label>
+        <label>Depreciation (% each year) <input id="depreciation" type="number" step="0.1" value="0"></label>
+        <label>Fuel price ($/MMBtu) <input id="fuel-price" type="number" step="0.1" value="8"></label>
+        <label>Fuel escalator (%/yr) <input id="fuel-escalator" type="number" step="0.1" value="0"></label>
+        <label>Solar fixed O&amp;M ($/kW-yr) <input id="solar-om" type="number" step="0.1" value="11"></label>
+        <label>BESS fixed O&amp;M ($/kW-yr) <input id="bess-om" type="number" step="0.1" value="2.5"></label>
+        <label>Generator fixed O&amp;M ($/kW-yr) <input id="gen-om" type="number" step="0.1" value="15"></label>
+        <label>Generator variable O&amp;M ($/kWh) <input id="gen-var" type="number" step="0.001" value="0.005"></label>
+        <label>BOS fixed O&amp;M ($/kW-yr) <input id="bos-om" type="number" step="0.1" value="6"></label>
+        <label>Soft O&amp;M (% CAPEX) <input id="soft-om" type="number" step="0.1" value="0"></label>
+        <label>O&amp;M escalator (%/yr) <input id="om-escalator" type="number" step="0.1" value="0"></label>
+      </div>
+      <label class="proxy">PVGIS CORS relay URL <input id="proxy" type="url" value="https://proxy.cors.dev/" spellcheck="false"></label>
+      <p class="hint">The free shared relay receives the requested coordinates and may log requests. Replace with your own proxy endpoint if desired; PVGIS data itself is public.</p>
+    </details>
+
+    <section class="panel actions">
+      <h2>4 · Run or optimize</h2>
+      <div class="button-row">
+        <button class="primary" id="run">Run current system</button>
+        <button data-opt="95" data-standalone="false">Optimize 95% with gas</button>
+        <button data-opt="99" data-standalone="false">Optimize 99% with gas</button>
+        <button data-opt="95" data-standalone="true">Optimize 95% without gas</button>
+        <button data-opt="99" data-standalone="true">Optimize 99% without gas</button>
+      </div>
+      <div id="status" role="status"></div>
+    </section>
+
+    <section id="results" class="panel hidden" aria-live="polite">
+      <h2>Results</h2><div id="result-content"></div>
+    </section>
+    <footer><span>PVGIS TMY · 20-year project · 4-hour battery · 92% round-trip battery efficiency</span><span>Open-source adaptation</span></footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -21,6 +21,9 @@ venv_st/
 env/
 .env/
 .venv/
+.venv*/
+wasm/target/
+site/pkg/
 
 # IDE specific files
 .idea/
@@ -40,4 +43,4 @@ env/
 
 # System files
 .DS_Store
-Thumbs.db 
+Thumbs.db
